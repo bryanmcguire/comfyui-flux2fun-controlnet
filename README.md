@@ -26,7 +26,7 @@ The model automatically detects the control type from your input image.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/bmcguire/comfyui-flux2fun-controlnet.git
+git clone https://github.com/bryanmcguire/comfyui-flux2fun-controlnet.git
 ```
 
 ### Method 2: Download ZIP
@@ -38,7 +38,7 @@ git clone https://github.com/bmcguire/comfyui-flux2fun-controlnet.git
 
 Download the ControlNet checkpoint and place in `ComfyUI/models/controlnet/`:
 
-- [FLUX.2-dev-Fun-Controlnet-Union.safetensors](https://huggingface.co/alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union/tree/main) (~3.5GB)
+- [FLUX.2-dev-Fun-Controlnet-Union.safetensors](https://huggingface.co/alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union/tree/main) (~8.3GB)
 
 ### Requirements
 
