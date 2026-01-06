@@ -356,7 +356,11 @@ class Flux2FunControlNet(nn.Module):
 # =============================================================================
 
 class ControlNetWrapper:
-    """Wrapper to integrate with ComfyUI's control system."""
+    """Wrapper to integrate with ComfyUI's control system.
+    
+    Supports chaining multiple Flux2Fun controlnets by accumulating them
+    into lists in transformer_options, which are processed by the patch.
+    """
     
     def __init__(self, controlnet, control_context, strength, ctrl_h, ctrl_w):
         self.controlnet = controlnet
@@ -380,11 +384,19 @@ class ControlNetWrapper:
             control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number, transformer_options)
         
         if transformer_options:
-            transformer_options['flux2_fun_controlnet'] = self.controlnet
-            transformer_options['flux2_fun_control_context'] = self.control_context
-            transformer_options['flux2_fun_control_scale'] = self.strength
-            transformer_options['flux2_fun_ctrl_h'] = self.ctrl_h
-            transformer_options['flux2_fun_ctrl_w'] = self.ctrl_w
+            # Use lists to support multiple chained Flux2Fun controlnets
+            # Initialize lists if this is the first Flux2Fun controlnet in the chain
+            if 'flux2_fun_controlnets' not in transformer_options:
+                transformer_options['flux2_fun_controlnets'] = []
+                transformer_options['flux2_fun_control_contexts'] = []
+                transformer_options['flux2_fun_control_scales'] = []
+                transformer_options['flux2_fun_ctrl_dims'] = []
+            
+            # Append this controlnet's data to the lists
+            transformer_options['flux2_fun_controlnets'].append(self.controlnet)
+            transformer_options['flux2_fun_control_contexts'].append(self.control_context)
+            transformer_options['flux2_fun_control_scales'].append(self.strength)
+            transformer_options['flux2_fun_ctrl_dims'].append((self.ctrl_h, self.ctrl_w))
         
         output = {"input": [], "output": []}
         if control_prev:
@@ -598,6 +610,10 @@ class Flux2FunControlNetApply:
         
         c = [[t[0], t[1].copy()] for t in conditioning]
         for t in c:
+            # Chain with existing control if present (supports multiple Flux2Fun controlnets)
+            existing_control = t[1].get('control', None)
+            if existing_control is not None:
+                wrapper.previous_controlnet = existing_control
             t[1]['control'] = wrapper
             t[1]['control_apply_to_uncond'] = True
         

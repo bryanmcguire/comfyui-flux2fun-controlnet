@@ -75,7 +75,12 @@ def patched_forward_orig(
         transformer_options={},
         attn_mask: Tensor = None,
 ) -> Tensor:
-    """Patched forward_orig with Flux2 Fun ControlNet support."""
+    """Patched forward_orig with Flux2 Fun ControlNet support.
+    
+    Supports:
+    - Multiple chained Flux2Fun controlnets (hints are summed)
+    - Reference latents (hints only applied to main image tokens)
+    """
     from comfy.ldm.flux.layers import timestep_embedding
     
     patches = transformer_options.get("patches", {})
@@ -119,26 +124,36 @@ def patched_forward_orig(
         pe = None
 
     # =========================================================================
-    # Flux2 Fun ControlNet
+    # Flux2 Fun ControlNet - Multiple ControlNet Support
     # =========================================================================
-    controlnet_hints = None
-    control_scale = transformer_options.get('flux2_fun_control_scale', 1.0)
-    control_layers_mapping = {}
-
-    flux2_fun_controlnet = transformer_options.get('flux2_fun_controlnet')
-    flux2_fun_control_context = transformer_options.get('flux2_fun_control_context')
-    ctrl_h = transformer_options.get('flux2_fun_ctrl_h')
-    ctrl_w = transformer_options.get('flux2_fun_ctrl_w')
+    # Read lists of controlnets (supports chaining multiple controlnets)
+    flux2_fun_controlnets = transformer_options.get('flux2_fun_controlnets', [])
+    flux2_fun_control_contexts = transformer_options.get('flux2_fun_control_contexts', [])
+    flux2_fun_control_scales = transformer_options.get('flux2_fun_control_scales', [])
+    flux2_fun_ctrl_dims = transformer_options.get('flux2_fun_ctrl_dims', [])
+    
+    # Accumulated hints from all controlnets: {layer_idx: [(hint, scale, main_tokens), ...]}
+    all_controlnet_hints = {}
     
     if not hasattr(self, '_flux2_fun_step_count'):
         self._flux2_fun_step_count = 0
     debug = (self._flux2_fun_step_count == 0)
 
-    if flux2_fun_controlnet is not None and flux2_fun_control_context is not None:
-        control_context = flux2_fun_control_context.to(device=img.device, dtype=img.dtype)
+    # Generate hints from each controlnet
+    for cn_idx, (controlnet, control_context, control_scale, (ctrl_h, ctrl_w)) in enumerate(
+            zip(flux2_fun_controlnets, flux2_fun_control_contexts, 
+                flux2_fun_control_scales, flux2_fun_ctrl_dims)):
+        
+        if controlnet is None or control_context is None:
+            continue
+            
+        control_context = control_context.to(device=img.device, dtype=img.dtype)
         
         if control_context.shape[0] != img.shape[0]:
             control_context = control_context.repeat(img.shape[0] // control_context.shape[0], 1, 1)
+
+        # Calculate main image token count (excludes reference latent tokens)
+        main_img_tokens = ctrl_h * ctrl_w
 
         try:
             temb_mod_img, temb_mod_txt = convert_modulation_to_diffusers(
@@ -147,12 +162,18 @@ def patched_forward_orig(
             
             image_rotary_emb = convert_pe_to_diffusers(pe)
             
-            if debug and image_rotary_emb is not None:
+            if debug and cn_idx == 0 and image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
                 print(f"[Flux2 Fun] RoPE: cos={cos.shape}, sin={sin.shape}")
+                print(f"[Flux2 Fun] img tokens: {img.shape[1]}, main tokens: {main_img_tokens}")
+                if img.shape[1] > main_img_tokens:
+                    print(f"[Flux2 Fun] Reference latent tokens detected: {img.shape[1] - main_img_tokens}")
             
-            controlnet_hints = flux2_fun_controlnet.forward_control(
-                x=img.clone(),
+            # Use only main image tokens for controlnet (not reference latents)
+            img_for_control = img[:, :main_img_tokens].clone()
+            
+            controlnet_hints = controlnet.forward_control(
+                x=img_for_control,
                 control_context=control_context,
                 encoder_hidden_states=txt.clone(),
                 temb_mod_params_img=temb_mod_img,
@@ -161,12 +182,24 @@ def patched_forward_orig(
                 ctrl_h=ctrl_h,
                 ctrl_w=ctrl_w,
                 txt_seq_len=txt.shape[1],
-                debug=debug,
+                debug=debug and cn_idx == 0,
             )
-            control_layers_mapping = flux2_fun_controlnet.control_layers_mapping
-                
+            
+            # Store hints with their scale and target token count
+            control_layers_mapping = controlnet.control_layers_mapping
+            for layer_idx, hint_idx in control_layers_mapping.items():
+                if hint_idx < len(controlnet_hints):
+                    if layer_idx not in all_controlnet_hints:
+                        all_controlnet_hints[layer_idx] = []
+                    all_controlnet_hints[layer_idx].append(
+                        (controlnet_hints[hint_idx], control_scale, main_img_tokens)
+                    )
+            
+            if debug:
+                print(f"[Flux2 Fun] ControlNet {cn_idx}: generated {len(controlnet_hints)} hints, scale={control_scale}")
+                    
         except Exception as e:
-            print(f"[Flux2 Fun] Error generating hints: {e}")
+            print(f"[Flux2 Fun] Error generating hints for controlnet {cn_idx}: {e}")
             import traceback
             traceback.print_exc()
     
@@ -209,37 +242,35 @@ def patched_forward_orig(
                              attn_mask=attn_mask,
                              transformer_options=transformer_options)
 
-        # Apply ControlNet hints at control layers
-        if controlnet_hints is not None and i in control_layers_mapping:
-            hint_idx = control_layers_mapping[i]
-            if hint_idx < len(controlnet_hints):
-                hint = controlnet_hints[hint_idx].to(img.device, dtype=img.dtype)
+        # Apply ControlNet hints at control layers (sum hints from all controlnets)
+        if i in all_controlnet_hints:
+            for hint, control_scale, main_img_tokens in all_controlnet_hints[i]:
+                hint = hint.to(img.device, dtype=img.dtype)
 
-                if hint.shape[1] != img.shape[1]:
+                # Resize hint if needed to match main image tokens
+                if hint.shape[1] != main_img_tokens:
                     def find_hw(seq_len):
                         for h in range(int(math.sqrt(seq_len)), 0, -1):
                             if seq_len % h == 0:
                                 return h, seq_len // h
                         return 1, seq_len
 
-                    if ctrl_h is not None and ctrl_w is not None:
-                        hint_h, hint_w = ctrl_h, ctrl_w
-                    else:
-                        hint_h, hint_w = find_hw(hint.shape[1])
-                    img_h, img_w = find_hw(img.shape[1])
+                    hint_h, hint_w = find_hw(hint.shape[1])
+                    target_h, target_w = find_hw(main_img_tokens)
 
                     hint_2d = hint.permute(0, 2, 1).reshape(hint.shape[0], hint.shape[2], hint_h, hint_w)
-                    hint_2d_up = torch.nn.functional.interpolate(hint_2d, size=(img_h, img_w), mode='bilinear', align_corners=False)
+                    hint_2d_up = torch.nn.functional.interpolate(hint_2d, size=(target_h, target_w), mode='bilinear', align_corners=False)
                     hint = hint_2d_up.reshape(hint.shape[0], hint.shape[2], -1).permute(0, 2, 1)
 
                 if hint.shape[0] != img.shape[0]:
                     hint = hint.repeat(img.shape[0] // hint.shape[0], 1, 1)
 
                 if debug:
-                    ratio = (hint * control_scale).abs().mean() / (img.abs().mean() + 1e-8)
-                    print(f"[Flux2 Fun] Layer {i}: hint={hint.abs().mean():.6f}, ratio={ratio:.4f}")
+                    ratio = (hint * control_scale).abs().mean() / (img[:, :main_img_tokens].abs().mean() + 1e-8)
+                    print(f"[Flux2 Fun] Layer {i}: hint={hint.abs().mean():.6f}, scale={control_scale}, ratio={ratio:.4f}")
 
-                img = img + hint * control_scale
+                # Apply hint ONLY to main image tokens, not reference latent tokens
+                img[:, :main_img_tokens] = img[:, :main_img_tokens] + hint * control_scale
 
         # Standard ComfyUI controlnet
         if control is not None:
