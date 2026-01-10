@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-flux2fun-controlnet"
-version = "1.0.2"
+version = "1.1.0"
 description = "ComfyUI implementation of FLUX.2-dev-Fun-Controlnet-Union from Alibaba's VideoX-Fun"
 readme = "README.md"
 license = {text = "Apache-2.0"}
