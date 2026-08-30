@@ -21,9 +21,11 @@ import folder_paths
 import comfy.utils
 import comfy.model_management
 
-# Apply monkey patch on import
+# Patch is NOT applied at import (that poisoned every Flux render in the
+# process whenever the core signature drifted). It is applied in
+# ControlNetWrapper.pre_run() at sampling start and removed in cleanup()
+# at sampling end.
 from . import flux_patch
-flux_patch.apply_patch()
 
 
 # =============================================================================
@@ -380,6 +382,9 @@ class ControlNetWrapper:
         self.extra_hooks = HooksContainer()
         
     def pre_run(self, model, percent_to_timestep_function):
+        # Scoped patch: applied only for sampling runs that use this wrapper.
+        # Raises (aborting the render with a clear message) on core drift.
+        flux_patch.apply_patch()
         if self.previous_controlnet:
             self.previous_controlnet.pre_run(model, percent_to_timestep_function)
     
@@ -416,6 +421,8 @@ class ControlNetWrapper:
         return c
     
     def cleanup(self):
+        # Restore the untouched core forward_orig at sampling end.
+        flux_patch.remove_patch()
         if self.previous_controlnet:
             self.previous_controlnet.cleanup()
     
